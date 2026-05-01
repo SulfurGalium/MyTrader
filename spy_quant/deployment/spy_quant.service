@@ -1,0 +1,34 @@
+[Unit]
+Description=SPY Quantitative Trading System
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+WorkingDirectory=/opt/spy_quant
+
+# Load environment from .env file
+EnvironmentFile=/opt/spy_quant/.env
+
+# Start the live trading loop
+ExecStart=/opt/spy_quant/venv/bin/python scripts/run_live.py
+
+# Restart policy
+Restart=on-failure
+RestartSec=60
+StartLimitInterval=600
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spy_quant
+
+# Resource limits
+LimitNOFILE=65536
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

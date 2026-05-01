@@ -1,0 +1,20 @@
+[Unit]
+Description=SPY Quant Web Dashboard
+After=network.target spy_quant.service
+Wants=spy_quant.service
+
+[Service]
+Type=simple
+User=quant
+Group=quant
+WorkingDirectory=/opt/spy_quant
+EnvironmentFile=/opt/spy_quant/.env
+ExecStart=/opt/spy_quant/venv/bin/python -m dashboard.server
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spy_quant_dashboard
+
+[Install]
+WantedBy=multi-user.target
