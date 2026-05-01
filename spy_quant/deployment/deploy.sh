@@ -31,7 +31,8 @@ apt-get update -qq
 apt-get install -y \
     python3.11 python3.11-venv python3.11-dev \
     python3-pip build-essential git curl wget \
-    htop tmux logrotate
+    htop tmux logrotate \
+    libssl-dev libffi-dev
 
 # ── 2. Create quant user ──────────────────────────────────────────────────────
 if ! id -u quant &>/dev/null; then
@@ -56,7 +57,7 @@ if [ ! -d "$VENV_DIR" ]; then
     sudo -u quant $PYTHON_BIN -m venv "$VENV_DIR"
 fi
 
-sudo -u quant "$VENV_DIR/bin/pip" install --upgrade pip
+sudo -u quant "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel
 sudo -u quant "$VENV_DIR/bin/pip" install -r "$PROJECT_DIR/requirements.txt"
 
 echo "Dependencies installed."
@@ -84,7 +85,7 @@ echo "  Start : systemctl start $SERVICE_NAME"
 echo "  Status: systemctl status $SERVICE_NAME"
 echo "  Logs  : journalctl -u $SERVICE_NAME -f"
 
-# ── 7. Log rotation ───────────────────────────────────────────────────────────
+# ── 7. Log rotation ──────────────────────────────────────────────────────────
 cat > /etc/logrotate.d/spy_quant << 'EOF'
 /opt/spy_quant/logs/*.log {
     daily
