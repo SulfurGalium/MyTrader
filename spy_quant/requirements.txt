@@ -19,6 +19,5 @@ fastapi>=0.110.0
 uvicorn>=0.29.0
 websocket-client>=1.6.0
 msgpack>=1.0.0
-# Pin aiohttp to exact version with pre-built wheels for Python 3.11
-# Newer versions require compilation and cause longintrepr.h errors
-aiohttp==3.8.1
+# aiohttp will be installed by alpaca-trade-api as a dependency
+# Let it resolve naturally to avoid build conflicts
