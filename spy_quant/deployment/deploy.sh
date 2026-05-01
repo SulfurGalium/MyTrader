@@ -32,7 +32,7 @@ apt-get install -y \
     python3.11 python3.11-venv python3.11-dev \
     python3-pip build-essential git curl wget \
     htop tmux logrotate \
-    libssl-dev libffi-dev
+    libssl-dev libffi-dev cython3
 
 # ── 2. Create quant user ──────────────────────────────────────────────────────
 if ! id -u quant &>/dev/null; then
@@ -58,7 +58,8 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 
 sudo -u quant "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel
-sudo -u quant "$VENV_DIR/bin/pip" install -r "$PROJECT_DIR/requirements.txt"
+# Install with --no-build-isolation to allow use of system Cython
+sudo -u quant "$VENV_DIR/bin/pip" install --no-build-isolation -r "$PROJECT_DIR/requirements.txt"
 
 echo "Dependencies installed."
 
