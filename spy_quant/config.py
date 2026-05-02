@@ -35,9 +35,12 @@ FRED_API_KEY      = os.getenv("FRED_API_KEY", "")
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 
 # ── Device (auto-detect if not set) ─────────────────────────────────────────
-_device_default = "cuda" if os.getenv("DEVICE") is None else os.getenv("DEVICE")
-# On Windows without CUDA drivers, fall back gracefully at runtime
-DEVICE         = _device_default
+# Bug fix: os.getenv("DEVICE") returns "" when the env var is set but empty,
+# and torch.device("") raises a RuntimeError.  Always fall back to "cuda" when
+# the env var is absent or blank; PyTorch itself will fall back to CPU at
+# runtime if no CUDA device is found.
+_device_env = os.getenv("DEVICE", "").strip()
+DEVICE = _device_env if _device_env else "cuda"
 
 BATCH_SIZE     = int(os.getenv("BATCH_SIZE", 64))
 EPOCHS         = int(os.getenv("EPOCHS", 50))
@@ -45,8 +48,13 @@ LEARNING_RATE  = float(os.getenv("LEARNING_RATE", 3e-4))
 
 SEQ_LEN        = 60   # 5-min bars  →  5 hours of history
 COARSE_FACTOR  = 6    # coarse = 30-min bars aggregated from 5-min
-FEATURE_DIM    = 11   # number of engineered features (see data/features.py)
+FEATURE_DIM    = 14   # 11 original + ba_spread + trade_imbalance + overnight_gap
 DIFFUSION_STEPS = 1000
+
+# Prediction horizon: how many bars ahead the model targets.
+# 1 = original (next 5-min bar only — very noisy).
+# 6 = 30-min forward return (sum of 6 bars) — ~3x better SNR, recommended.
+TARGET_HORIZON = int(os.getenv("TARGET_HORIZON", 6))
 
 # ── Risk parameters ───────────────────────────────────────────────────────────
 MAX_POSITION_RISK = float(os.getenv("MAX_POSITION_RISK", 0.01))
