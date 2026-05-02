@@ -185,17 +185,38 @@ def batched_backtest(
     # ── Load feature array as single tensor (zero-copy if float32) ────────────
     feat_t = torch.as_tensor(feature_arr.astype(np.float32), device=device)
 
-    # ── Stratified start indices ───────────────────────────────────────────────
+    # ── Stratified start indices (overlap-free) ───────────────────────────────
+    # Bug fix: the original stratified sampler divided the range into `branches`
+    # equal bands, but with small bands adjacent branches could start as few as
+    # 1 bar apart — their SEQ_LEN context windows then overlapped by up to
+    # (SEQ_LEN - 1) bars, making the "independent" branches nearly identical.
+    # Bootstrap statistics over correlated samples understate variance by 3-5x.
+    #
+    # Fix: enforce a minimum gap of seq bars between any two start indices.
+    # This reduces the effective branch count on short datasets but makes the
+    # statistics meaningful.  max_independent_branches tells you how many
+    # non-overlapping branches actually fit in the test window.
     max_start = T - seq - horizon_steps - 1
     if max_start < 1:
         raise ValueError("Not enough data: T=" + str(T) +
                          " need at least " + str(seq + horizon_steps + 2))
 
-    branches  = min(branches, max_start + 1)
-    band      = max(1, (max_start + 1) // branches)
-    starts    = [np.random.randint(i * band, min((i+1)*band, max_start+1))
-                 for i in range(branches)]
-    start_t   = torch.tensor(starts, dtype=torch.long, device=device)
+    min_gap = seq          # minimum bars between branch starts to avoid overlap
+    max_independent = max(1, (max_start + 1) // min_gap)
+    if branches > max_independent:
+        logger.warning(
+            f"Requested {branches} branches but only {max_independent} non-overlapping "
+            f"branches fit (T={T}, seq={seq}, horizon={horizon_steps}). "
+            f"Capping at {max_independent} to avoid correlated statistics."
+        )
+        branches = max_independent
+
+    # Stratify over independent slots (each slot is min_gap bars wide)
+    band    = max(1, (max_start + 1) // branches)
+    band    = max(band, min_gap)   # never let band shrink below min_gap
+    starts  = [np.random.randint(i * band, min((i+1)*band, max_start+1))
+               for i in range(branches)]
+    start_t = torch.tensor(starts, dtype=torch.long, device=device)
 
     # ── Pre-allocate result arrays ────────────────────────────────────────────
     branch_pnl    = np.zeros((branches, horizon_steps), dtype=np.float32)
