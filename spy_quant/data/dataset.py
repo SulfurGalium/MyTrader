@@ -5,7 +5,13 @@ all at once.  Yields (fine_window, coarse_window, target) tuples.
 
   fine_window  : (SEQ_LEN, F)         — 5-min bars
   coarse_window: (SEQ_LEN//FACTOR, F) — aggregated coarser context
-  target       : scalar float         — next-bar log return
+  target       : scalar float         — forward log return (horizon bars ahead)
+
+The `horizon` parameter controls the prediction target:
+  horizon=1  (original) — predict next single 5-min bar return
+  horizon=6  (default)  — predict 30-min forward return (sum of 6 bars)
+                          substantially better SNR at 5-min granularity;
+                          matches a realistic hold-and-exit cadence
 """
 from __future__ import annotations
 
@@ -25,6 +31,10 @@ except ImportError:
     Dataset = object  # type: ignore
     _TORCH_AVAILABLE = False
 
+# Default horizon: 6 bars = 30 minutes at 5-min frequency.
+# Override via env var or pass explicitly.
+_DEFAULT_HORIZON = int(getattr(config, "TARGET_HORIZON", 6))
+
 
 class SPYWindowDataset(Dataset):
     """
@@ -36,6 +46,10 @@ class SPYWindowDataset(Dataset):
     seq_len       : look-back window in bars
     coarse_factor : downsample factor for coarse branch
     target_col    : column index of log_return (default 0)
+    horizon       : how many bars ahead to predict.
+                    target = sum(log_returns[i : i+horizon])
+                    horizon=1 → original behaviour (next bar only)
+                    horizon=6 → 30-min forward return (recommended)
     """
 
     def __init__(
@@ -44,14 +58,16 @@ class SPYWindowDataset(Dataset):
         seq_len:       int = config.SEQ_LEN,
         coarse_factor: int = config.COARSE_FACTOR,
         target_col:    int = 0,
+        horizon:       int = _DEFAULT_HORIZON,
     ) -> None:
-        # Store as float32 once so __getitem__ never re-casts the full array
         self.data          = data.astype(np.float32) if data.dtype != np.float32 else data
         self.seq_len       = seq_len
         self.coarse_factor = coarse_factor
         self.target_col    = target_col
+        self.horizon       = max(1, horizon)
+        # Need seq_len bars of context + horizon bars of future
         self._start        = seq_len
-        self._end          = len(data) - 1
+        self._end          = len(data) - self.horizon   # leave room for horizon
 
     def __len__(self) -> int:
         return max(0, self._end - self._start)
@@ -60,7 +76,11 @@ class SPYWindowDataset(Dataset):
         import torch
         i      = self._start + idx
         window = self.data[i - self.seq_len : i]       # (L, F)  already float32
-        target = float(self.data[i, self.target_col])
+
+        # Sum log returns over the horizon window for a less-noisy target.
+        # For horizon=1 this is identical to the original single-bar target.
+        future = self.data[i : i + self.horizon, self.target_col]
+        target = float(future.sum())
 
         fine = torch.from_numpy(window)                # zero-copy view
 
@@ -82,10 +102,11 @@ def make_loader(
     shuffle:     bool = True,
     num_workers: int  = 0,       # 0 = main process (safe on Windows + low RAM)
     pin_memory:  bool = False,   # only useful with CUDA GPU
+    horizon:     int  = _DEFAULT_HORIZON,
     **kwargs,
 ):
     from torch.utils.data import DataLoader
-    ds = SPYWindowDataset(data)
+    ds = SPYWindowDataset(data, horizon=horizon)
     return DataLoader(
         ds,
         batch_size=batch_size,
