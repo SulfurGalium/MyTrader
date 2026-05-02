@@ -7,6 +7,12 @@ scikit-learn>=1.4.0
 scipy>=1.13.0
 joblib>=1.3.0
 
+# PyTorch with CUDA 12.1 support (compatible with CUDA 13.2 runtime)
+# Install via: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+torch>=2.3.0
+torchvision>=0.18.0
+torchaudio>=2.3.0
+
 # Alpaca — use alpaca-py (v3, Python 3.14 compatible, no aiohttp issues)
 # alpaca-trade-api is legacy and has aiohttp build failures on Python 3.12+
 alpaca-py>=0.20.0
