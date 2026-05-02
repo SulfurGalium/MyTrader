@@ -1,27 +1,29 @@
 # SPY Quant — Model-Driven Intraday Trading System
 
-A production-grade quantitative trading pipeline for SPY that takes raw 5-minute OHLCV data through feature engineering, diffusion model training, walk-forward backtesting, and live deployment via Alpaca — designed to run continuously on a Vultr VPS.
+A quantitative trading pipeline for SPY: raw 5-minute OHLCV → feature engineering → diffusion model training → walk-forward backtesting → live execution via Alpaca. Designed to run continuously on a Vultr VPS.
 
 ---
 
-## What Changed (recent improvements)
+## Recent Changes
 
 | File | Change |
 |---|---|
-| `config.py` | `FEATURE_DIM` 11 → 14 · `TARGET_HORIZON=6` added · `DEVICE=""` crash fixed |
-| `data/features.py` | 3 new microstructure features: `ba_spread`, `trade_imbalance`, `overnight_gap` |
-| `data/dataset.py` | `horizon` param — default target is now 30-min forward return (6 bars) not 1-bar |
+| `config.py` | `FEATURE_DIM` 11 → 14 · `TARGET_HORIZON=6` · `DEVICE=""` crash fixed |
+| `data/features.py` | 3 new features: `ba_spread`, `trade_imbalance`, `overnight_gap` |
+| `data/dataset.py` | `horizon` param — target is now 30-min forward return (6 bars) |
 | `trading/inference.py` | Ensemble 32×50 → 64×20 DDIM · returns `(signal, vov)` tuple |
-| `trading/live.py` | Position sizing 2× leverage bug fixed · regime gate added (skips choppy markets) |
-| `backtest/simulation.py` | MC branches now enforced non-overlapping (min `SEQ_LEN` gap between starts) |
-| `scripts/run_live.py` | `TradingSession` created once (not per-cycle) so regime history persists |
-| `deployment/deploy.sh` | Double-nesting fix · auto-generates `.env.example` if missing |
+| `trading/live.py` | Position sizing 2× leverage bug fixed · regime gate added |
+| `backtest/simulation.py` | Non-overlapping MC branches (min `SEQ_LEN` gap enforced) |
+| `scripts/run_live.py` | `TradingSession` created once so regime history persists |
+| `deployment/deploy.sh` | Double-nesting fix · auto-generates env template if missing |
+| `gpu_utils.py` | Clear diagnostics when `DEVICE=cuda` but CPU wheel is installed |
+| `setup_windows.ps1` | Auto-detects GPU · installs correct PyTorch wheel · fixes parse errors |
 
-> **Retraining required**: `FEATURE_DIM` changed from 11 → 14. Old checkpoints are incompatible — delete them before training.
+> **Retraining required after this update**: `FEATURE_DIM` changed 11 → 14. Delete old checkpoints before running `train.py`.
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
 Raw OHLCV (5-min)
@@ -30,26 +32,25 @@ Raw OHLCV (5-min)
  data/loader.py          ←── UST10Y (FRED, cached 12h)
       │   build_raw_dataset()
       ▼
- data/features.py        — 14 engineered features (see table below)
+ data/features.py        — 14 engineered features
       │   compute_features()
       ▼
- data/preprocessing.py   — stationarity + RobustScaler (train-only fit, no leakage)
-      │   preprocess()
+ data/preprocessing.py   — stationarity · RobustScaler (fit on train only)
+      │   preprocess()  saves → models/feature_scaler.pkl
       ▼
  data/dataset.py         — lazy rolling windows · horizon=6 (30-min target)
       │   SPYWindowDataset
       ▼
  models/diffusion.py     — MultiTimeframeDiffusion
-      │   Fine encoder (5-min) → Coarse encoder (30-min) → Cross-attention → DDPM head
+      │   Fine encoder (5-min) + Coarse encoder (30-min) + Cross-attention + DDPM head
       ▼
  models/trainer.py       — AdamW · CosineAnnealingLR · AMP · dual checkpoint
-      │
+      │   saves → models/diffusion_latest.pt
+      │            models/diffusion_best_trading.pt
       ▼
  backtest/simulation.py  — Regime detection · non-overlapping MC branches · WFO
-      │
       ▼
- trading/inference.py    — 64-sample DDIM ensemble · SNR-weighted signal · returns vov
-      │
+ trading/inference.py    — 64-sample × 20-step DDIM ensemble · SNR signal · returns vov
       ▼
  trading/live.py         — Regime gate · fixed sizing · Alpaca bracket orders
 ```
@@ -62,54 +63,53 @@ Raw OHLCV (5-min)
 |---|------|-------------|
 | 0 | `log_return` | Bar-to-bar log return |
 | 1 | `realized_vol` | 20-bar rolling σ of log returns |
-| 2 | `vol_of_vol` | 20-bar rolling σ of realized_vol — also drives the regime gate |
+| 2 | `vol_of_vol` | 20-bar rolling σ of realized_vol — drives the regime gate |
 | 3 | `momentum_20` | 20-bar price momentum |
 | 4 | `momentum_60` | 60-bar price momentum |
 | 5 | `vwap_dev` | Deviation from 20-bar VWAP |
 | 6 | `spread_proxy` | (high−low) / close |
 | 7 | `volume_z` | Z-score of log volume (20-bar) |
-| 8 | `ust10y` | UST 10-yr yield (Δ-differenced, stationarised) |
+| 8 | `ust10y` | UST 10-yr yield (Δ-differenced) |
 | 9 | `yield_change_5d` | 5-day change in UST10Y |
 | 10 | `bar_of_day` | Fraction through NYSE session [0, 1] |
-| 11 | `ba_spread` | Bid-ask spread / mid (real quote when available, else high-low proxy) |
-| 12 | `trade_imbalance` | (close−open) / (high−low) — buy/sell pressure proxy [-1, 1] |
+| 11 | `ba_spread` | Bid-ask spread / mid (quote data if available, else high-low proxy) |
+| 12 | `trade_imbalance` | (close−open) / (high−low) — buy/sell pressure [-1, 1] |
 | 13 | `overnight_gap` | log(open / prev_close) — pre-market gap signal |
 
 ---
 
-## Model: MultiTimeframeDiffusion
+## Model
 
 - **Fine encoder** — 3-layer Transformer over 60 × 5-min bars
-- **Coarse encoder** — 3-layer Transformer over 10 × 30-min aggregated bars
-- **Fusion** — Cross-attention: fine queries attend to coarse keys/values
-- **Diffusion head** — DDPM ε-prediction MLP with cosine noise schedule (1000 steps)
-- **Inference** — DDIM fast sampling (20 steps), 64-sample ensemble for SNR-weighted signal
+- **Coarse encoder** — 3-layer Transformer over 10 × 30-min bars
+- **Fusion** — Cross-attention (fine queries, coarse keys/values)
+- **Head** — DDPM ε-prediction MLP, cosine noise schedule (1000 steps)
+- **Inference** — DDIM (20 steps), 64-sample ensemble, SNR-weighted signal
 - **Target** — Sum of log returns over next 6 bars (30-min forward return)
 
 ---
 
 ## Training on Your Home PC
 
-### Hardware requirements
+### Hardware
 
-| Setup | What to expect |
+| Setup | Expected time |
 |---|---|
-| **CPU only, 8 GB RAM** | Works. 4–8 hours for 50 epochs on 4 years of data. Use `--batch-size 32`. |
-| **CPU only, 16 GB RAM** | Comfortable. 3–5 hours. Default batch size (64) is fine. |
-| **NVIDIA GPU (6 GB+ VRAM)** | 30–60 min for 50 epochs. Set `DEVICE=cuda` in `.env`. |
-| **Apple Silicon (M1/M2/M3)** | Use `DEVICE=mps`. 1–2 hours. Requires PyTorch ≥ 2.0. |
-| **Minimum disk** | ~2 GB for data + checkpoints. |
+| CPU only, 8 GB RAM | 4–8 hours (50 epochs, 4 years data). Use `--batch-size 32`. |
+| CPU only, 16 GB RAM | 3–5 hours. Default batch size (64) is fine. |
+| NVIDIA GPU, 6 GB+ VRAM | 30–60 minutes. Set `DEVICE=cuda` in `.env`. |
+| Apple Silicon (M1/M2/M3) | 1–2 hours. Set `DEVICE=mps`. Requires PyTorch ≥ 2.0. |
 
-The trainer auto-scales batch size to available RAM (16 if < 2 GB free, 32 if < 3 GB free, 64 otherwise). Override with `--batch-size`.
+The trainer auto-scales batch size to available RAM. Override with `--batch-size`.
 
 ---
 
 ### Step 1 — Prerequisites
 
-**Python 3.10, 3.11, or 3.12** required. Python 3.13+ not yet supported.
+**Python 3.10, 3.11, or 3.12.** Python 3.13/3.14 works but some packages have limited wheel availability — if you hit build errors, install 3.12 instead.
 
 ```bash
-python --version   # or python3 --version on Linux/macOS
+python --version
 ```
 
 Download: https://www.python.org/downloads/
@@ -121,105 +121,112 @@ Download: https://www.python.org/downloads/
 
 ---
 
-### Step 2 — Get the code
+### Step 2 — Clone the repo
 
 ```bash
 git clone <your-repo-url> mytrader
 cd mytrader/spy_quant
 ```
 
-> The repo root is `MyTrader/` — you must `cd` into `spy_quant/` before running anything.
+> The repo root is `MyTrader/`. You must `cd` into `spy_quant/` — everything runs from there.
 
 ---
 
 ### Step 3 — Set up the environment
 
-**Windows (PowerShell):**
+#### Windows
+
 ```powershell
-# Allow scripts (one-time)
+# One-time: allow PowerShell scripts to run
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
-# Creates venv, installs deps, copies .env
+# Run setup — creates venv, installs all deps including PyTorch, copies .env
 .\setup_windows.ps1
 ```
 
-**macOS / Linux:**
+`setup_windows.ps1` automatically:
+- Detects your GPU via `nvidia-smi`
+- Installs the CUDA 12.1 PyTorch wheel if a GPU is found, CPU wheel otherwise
+- Generates `.env` from template
+- Warns you if `DEVICE=cpu` is set but a GPU is present
+
+**After setup, verify GPU is working:**
+```powershell
+.\venv\Scripts\Activate.ps1
+python -c "import torch; print(torch.cuda.is_available()); print(torch.__version__)"
+# Should print: True  and a version ending in +cu121
+```
+
+If you see `False` and the version ends in `+cpu`, the wrong wheel was installed. Fix:
+```powershell
+.\venv\Scripts\pip.exe uninstall torch torchvision torchaudio -y
+.\venv\Scripts\pip.exe install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+Check your driver's supported CUDA version first with `nvidia-smi` (top-right corner). Use `cu121` for CUDA 12.x drivers, `cu118` for CUDA 11.8.
+
+#### macOS / Linux
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-cp .env.example .env
+cp env.example .env      # note: file is named env.example (no dot prefix)
 ```
+
+PyTorch is included in `requirements.txt` and will install automatically. The default wheel is CUDA 12.1 compatible. On macOS, pip will resolve the correct wheel for your platform.
 
 ---
 
-### Step 4 — Install PyTorch
+### Step 4 — Configure .env
 
-PyTorch isn't pinned in `requirements.txt` because the right wheel depends on your hardware. Install it separately:
-
+```powershell
+notepad .env        # Windows
+```
 ```bash
-# CPU only (works everywhere)
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# NVIDIA GPU — CUDA 12.1
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# NVIDIA GPU — CUDA 11.8
-pip install torch --index-url https://download.pytorch.org/whl/cu118
-
-# Apple Silicon (M1/M2/M3) — MPS included in the standard wheel
-pip install torch
+nano .env           # Linux
+open -e .env        # macOS
 ```
 
-Verify:
-```bash
-python -c "import torch; print(torch.__version__)"
-# CUDA:  python -c "import torch; print(torch.cuda.is_available())"
-# MPS:   python -c "import torch; print(torch.backends.mps.is_available())"
-```
-
----
-
-### Step 5 — Configure your .env
-
-```bash
-notepad .env      # Windows
-open -e .env      # macOS
-nano .env         # Linux
-```
-
-Minimum keys needed:
+Required keys:
 
 ```env
+# Alpaca — paper trading is safe default
 ALPACA_API_KEY=your_key_here
 ALPACA_SECRET_KEY=your_secret_here
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 
+# FRED — free key for Treasury yield data
 FRED_API_KEY=your_fred_key_here
 
+# Safety gate — keep false during testing
 LIVE_TRADING_ENABLED=false
 
-# "cuda" (NVIDIA), "mps" (Apple Silicon), or "cpu"
-DEVICE=cpu
+# Device: cuda (NVIDIA), mps (Apple Silicon), cpu
+DEVICE=cuda
 
-# 6 = 30-min forward return (recommended)
+# Prediction horizon (6 = 30-min forward return, recommended)
 TARGET_HORIZON=6
 ```
 
 Free API keys:
-- **Alpaca** (data + paper trading): https://alpaca.markets → sign up → API Keys
-- **FRED** (Treasury yield): https://fred.stlouisfed.org/docs/api/api_key.html
+- **Alpaca**: https://alpaca.markets → sign up → Paper Trading → API Keys
+- **FRED**: https://fred.stlouisfed.org/docs/api/api_key.html
 
 ---
 
-### Step 6 — Train
+### Step 5 — Train
 
-**Windows:**
+**Windows** (activate venv first):
 ```powershell
 .\venv\Scripts\Activate.ps1
 python scripts\train.py --alpaca --start 2020-01-01
-# or: run.bat train
+```
+
+Or use the launcher (no activation needed):
+```powershell
+run.bat train
 ```
 
 **macOS / Linux:**
@@ -232,75 +239,98 @@ python scripts/train.py --alpaca --start 2020-01-01
 
 | Flag | Default | Description |
 |---|---|---|
-| `--alpaca` | — | Pull live data from Alpaca |
+| `--alpaca` | — | Pull data live from Alpaca API |
 | `--data path/file.parquet` | — | Use a local Parquet file instead |
-| `--start 2020-01-01` | `2020-01-01` | Data start date |
-| `--end 2024-12-31` | today | Data end date |
-| `--epochs 50` | 50 | Max epochs (early stopping may end sooner) |
+| `--start 2020-01-01` | `2020-01-01` | Start date |
+| `--end 2024-12-31` | today | End date |
+| `--epochs 50` | from `.env` | Max epochs |
 | `--batch-size 32` | auto | Override auto-detected batch size |
-| `--device cpu` | from `.env` | Force a specific device |
-| `--patience 80` | 80 | Early stopping patience |
-| `--no-trading-selection` | off | Checkpoint by val loss instead of sign accuracy |
+| `--device cuda` | from `.env` | Override device |
+| `--patience 80` | 80 | Early stopping patience (epochs without improvement) |
+| `--no-trading-selection` | off | Save checkpoint by val loss instead of sign accuracy |
 
-**Healthy training output:**
+**Healthy output:**
 ```
 Epoch  1/50 | train_loss=0.843 | val_loss=0.789 | sign_acc=0.521
 Epoch  5/50 | train_loss=0.610 | val_loss=0.583 | sign_acc=0.537
 Epoch 10/50 | train_loss=0.534 | val_loss=0.521 | sign_acc=0.549
 ...
-✓ Best trading checkpoint → models/trading_model.pt  (sign_acc=0.554)
-✓ Best loss checkpoint   → models/best_model.pt      (val_loss=0.510)
+✓ Best trading checkpoint → models/diffusion_best_trading.pt  (sign_acc=0.554)
+✓ Latest checkpoint      → models/diffusion_latest.pt
 ```
 
-Sign accuracy above **0.53** is meaningful. Above **0.55** is strong. `trading_model.pt` is what inference uses.
+Sign accuracy above **0.53** is meaningful signal. Above **0.55** is strong.
+
+**Files saved after training:**
+
+| File | What it is |
+|---|---|
+| `models/diffusion_best_trading.pt` | Best directional accuracy checkpoint — used by inference |
+| `models/diffusion_latest.pt` | Most recent epoch checkpoint |
+| `models/feature_scaler.pkl` | Fitted RobustScaler — must be deployed alongside the model |
 
 ---
 
-### Step 7 — Backtest
+### Step 6 — Backtest
 
-```bash
-python scripts/evaluate.py --alpaca     # macOS/Linux
-python scripts\evaluate.py --alpaca     # Windows
+```powershell
+# Windows
+run.bat evaluate
+# or: python scripts\evaluate.py --alpaca
 ```
 
-Runs the walk-forward Monte Carlo on the held-out test set (last 15% of data, never seen during training). Aim for Sharpe > 0.5, max drawdown < 20% before going live.
+```bash
+# macOS / Linux
+python scripts/evaluate.py --alpaca
+```
+
+Runs walk-forward Monte Carlo on the held-out test set (last 15% of data — never seen during training). Aim for Sharpe > 0.5 and max drawdown < 20% before going live.
 
 ---
 
-### Step 8 — Paper trade locally
+### Step 7 — Paper trade locally
 
-```bash
-python scripts/run_live.py     # macOS/Linux
-python scripts\run_live.py     # Windows
-# or: run.bat live
+```powershell
+# Windows
+run.bat live
+# or: .\venv\Scripts\Activate.ps1 then python scripts\run_live.py
 ```
 
-Fires every 5 minutes during NYSE hours. With `LIVE_TRADING_ENABLED=false` (default), it logs what it *would* do without submitting orders. Check `logs/live_YYYY-MM-DD.log` to see signals and regime gate decisions.
+```bash
+# macOS / Linux
+python scripts/run_live.py
+```
+
+Fires every 5 minutes during NYSE hours. With `LIVE_TRADING_ENABLED=false` (default), logs what it *would* do without submitting orders. Check `logs/live_YYYY-MM-DD.log` for signals and regime gate decisions.
 
 Open the dashboard in a second terminal:
+```powershell
+run.bat dashboard        # Windows — also opens browser automatically
+```
 ```bash
-python -m dashboard.server
+python -m dashboard.server   # macOS / Linux
 # visit http://localhost:8080
 ```
 
----
-
-### Step 9 — Deploy to the server
-
-Copy your trained checkpoint to the VPS instead of retraining there (much faster):
-
-```bash
-# From your home PC
-scp models/trading_model.pt  root@<server-ip>:/opt/spy_quant/models/
-scp models/best_model.pt     root@<server-ip>:/opt/spy_quant/models/
-scp models/scaler.pkl        root@<server-ip>:/opt/spy_quant/models/
+Other launcher commands:
+```powershell
+run.bat monitor     # terminal status view
+run.bat optimize    # walk-forward optimization
+run.bat report      # generate HTML session report
+run.bat shell       # open an activated venv shell
 ```
 
-Then on the server:
+---
+
+### Step 8 — Copy checkpoint to server
+
+Train locally on your GPU, then copy the checkpoint to the VPS. This is much faster than retraining on a CPU-only server.
+
 ```bash
-sudo systemctl start spy_quant
-sudo systemctl start spy_quant_dashboard
-sudo journalctl -u spy_quant -f
+# From your home PC — replace <server-ip>
+scp models/diffusion_best_trading.pt  root@<server-ip>:/opt/spy_quant/models/
+scp models/diffusion_latest.pt        root@<server-ip>:/opt/spy_quant/models/
+scp models/feature_scaler.pkl         root@<server-ip>:/opt/spy_quant/models/
 ```
 
 ---
@@ -309,20 +339,23 @@ sudo journalctl -u spy_quant -f
 
 | Problem | Fix |
 |---|---|
-| `No module named 'torch'` | See Step 4 — install the right PyTorch wheel for your hardware manually |
-| `ALPACA_API_KEY not set` | Make sure `.env` is saved and you're running from inside `spy_quant/` |
-| Training very slow on CPU | Normal. Try `--start 2022-01-01` for less data, or run overnight |
+| `torch.cuda.is_available()` returns `False` | CPU wheel installed. Run: `pip uninstall torch torchvision torchaudio -y` then reinstall with `--index-url https://download.pytorch.org/whl/cu121` |
+| Version string shows `+cpu` not `+cu121` | Same as above — wrong wheel |
+| `ALPACA_API_KEY not set` | Check `.env` is saved and you're running from `spy_quant/` |
+| Training very slow | Normal on CPU. Use `--start 2022-01-01` for less data, or run overnight |
 | `CUDA out of memory` | Lower batch size: `--batch-size 16` or `--batch-size 8` |
-| Checkpoint errors after code update | `FEATURE_DIM` changed 11→14. Delete old checkpoints and retrain |
-| `torch.device("")` RuntimeError | Fixed in new `config.py`. Set `DEVICE=cpu` (not blank) in `.env` |
+| Checkpoint load error after updating code | `FEATURE_DIM` changed 11→14 — old checkpoints are incompatible, delete and retrain |
+| `Parse error` in `setup_windows.ps1` | Pull latest version — heredoc unicode issue is fixed |
+| `Access denied` on Task Scheduler | Script must run as Administrator for that step — it now skips gracefully and prints the manual command |
 
-**Delete old incompatible checkpoints:**
-```bash
+**Delete incompatible old checkpoints:**
+```powershell
 # Windows
-del models\best_model.pt models\trading_model.pt models\scaler.pkl
-
+del models\diffusion_best_trading.pt models\diffusion_latest.pt models\feature_scaler.pkl
+```
+```bash
 # macOS / Linux
-rm models/best_model.pt models/trading_model.pt models/scaler.pkl
+rm models/diffusion_best_trading.pt models/diffusion_latest.pt models/feature_scaler.pkl
 ```
 
 ---
@@ -332,24 +365,26 @@ rm models/best_model.pt models/trading_model.pt models/scaler.pkl
 ### Option A: Bare-metal (systemd)
 
 ```bash
-# 1. Clone — repo root is MyTrader/, must cd into spy_quant/ first
+# 1. Clone — cd into spy_quant/ before running deploy.sh
 git clone <your-repo-url> /tmp/mytrader
 cd /tmp/mytrader/spy_quant
 
-# 2. Deploy (installs to /opt/spy_quant, creates quant user, registers services)
+# 2. Deploy as root — installs to /opt/spy_quant, creates quant user,
+#    registers both systemd services, generates .env from template
 sudo bash deployment/deploy.sh
 
-# 3. Edit .env
+# 3. Add your API keys
 sudo nano /opt/spy_quant/.env
 
-# 4a. Train on server (30–90 min, CPU)
-sudo -u quant /opt/spy_quant/venv/bin/python scripts/train.py --alpaca
+# 4. Copy trained checkpoint from your home PC (recommended)
+#    Run these from your home PC:
+#    scp models/diffusion_best_trading.pt root@<ip>:/opt/spy_quant/models/
+#    scp models/feature_scaler.pkl        root@<ip>:/opt/spy_quant/models/
+#
+#    Or train on the server directly (30-90 min on CPU):
+#    sudo -u quant /opt/spy_quant/venv/bin/python scripts/train.py --alpaca
 
-# 4b. Or SCP checkpoint from home PC (recommended)
-#     scp models/trading_model.pt root@<ip>:/opt/spy_quant/models/
-#     scp models/scaler.pkl       root@<ip>:/opt/spy_quant/models/
-
-# 5. Start (sudo required for all systemctl commands)
+# 5. Start services — sudo required for all systemctl commands
 sudo systemctl start spy_quant
 sudo systemctl start spy_quant_dashboard
 
@@ -358,15 +393,17 @@ sudo systemctl status spy_quant
 sudo journalctl -u spy_quant -f
 ```
 
-> **Why `sudo` is always required for `systemctl`**: communicates with PID 1 via D-Bus — a root operation. Running without `sudo` gives *"Failed to connect to bus"*. This is a Linux security boundary, not a bug.
+> `systemctl` always needs `sudo` — it communicates with PID 1 via D-Bus. Running without `sudo` gives *"Failed to connect to bus"*. This is a Linux security requirement, not a bug.
 
 ### Option B: Docker Compose
 
 ```bash
-cp .env.example .env && nano .env
+# From inside spy_quant/
+cp env.example .env
+nano .env          # add your API keys
 cd deployment
 docker compose up -d
-docker logs -f spy_quant
+docker logs -f spy_quant_trading
 ```
 
 ### Recommended Vultr instance
@@ -376,25 +413,24 @@ docker logs -f spy_quant
 | CPU | 2 vCPU | 4 vCPU |
 | RAM | 4 GB | 8 GB |
 | Storage | 40 GB SSD | 80 GB SSD |
-| GPU | — | NVIDIA A16 (server-side training only) |
 
-Train at home on GPU, `scp` the checkpoint to a cheap CPU-only VPS ($6–12/mo) for inference.
+Train locally on your GPU and `scp` the checkpoint. Inference is lightweight — a $6/mo CPU instance handles it fine.
 
 ---
 
 ## Safety System
 
-Five independent safety layers in `trading/live.py`:
+Five layers in `trading/live.py`, all must pass before any order is submitted:
 
-1. **`LIVE_TRADING_ENABLED` flag** — must be explicitly `"true"`. Default is dry-run.
-2. **Market-hours check** — Alpaca clock API; no orders outside NYSE session.
-3. **Regime gate** — `vol_of_vol` tracked in a rolling 500-bar window. If current reading exceeds the 80th percentile → `reason="regime_choppy"`, cycle skipped. Automatically sits out choppy markets.
-4. **Signal threshold** — `|signal| < 0.15` dropped.
+1. **`LIVE_TRADING_ENABLED=true`** — must be explicitly set. Default is dry-run.
+2. **Market hours** — Alpaca clock API checked; no orders outside NYSE session.
+3. **Regime gate** — `vol_of_vol` (feature 2) tracked in a 500-bar rolling window. If above the 80th percentile, cycle is skipped (`reason="regime_choppy"`).
+4. **Signal threshold** — `|signal| < 0.15` is dropped.
 5. **Cooldown** — minimum 5 minutes between signals.
 
-All orders are **bracket orders** (entry + stop-loss + take-profit) — every position has defined maximum loss before submission.
+All orders are **bracket orders** with stop-loss and take-profit set before submission.
 
-**Position sizing**: `shares = floor(equity × MAX_POSITION_RISK / (price × STOP_LOSS_PCT))`. At defaults (risk=1%, SL=0.5%), a stop hit costs exactly 1% of equity. No leverage, no signal-strength amplification.
+**Position sizing**: `shares = floor(equity × MAX_POSITION_RISK / (price × STOP_LOSS_PCT))`. At defaults (1% risk, 0.5% stop), a stop hit costs exactly 1% of equity.
 
 ---
 
@@ -402,45 +438,51 @@ All orders are **bracket orders** (entry + stop-loss + take-profit) — every po
 
 ```
 spy_quant/
-├── config.py                  ← central config (reads .env)
-├── requirements.txt
-├── .env.example               ← copy to .env, fill in keys
-├── setup_windows.ps1          ← Windows one-shot setup
-├── run.bat                    ← Windows launcher (train/live/dashboard)
+├── config.py                    ← all config, reads .env
+├── gpu_utils.py                 ← CUDA setup with clear diagnostics
+├── requirements.txt             ← includes torch>=2.3.0 (CUDA 12.1)
+├── env.example                  ← copy to .env and fill in keys
+├── setup_windows.ps1            ← Windows: auto-detects GPU, installs everything
+├── run.bat                      ← Windows launcher (train/evaluate/live/dashboard/etc)
 │
 ├── data/
-│   ├── loader.py              ← OHLCV + FRED loader (12h cache)
-│   ├── features.py            ← 14 engineered features
-│   ├── preprocessing.py       ← stationarity + leak-free RobustScaler
-│   └── dataset.py             ← lazy rolling-window Dataset (horizon param)
+│   ├── loader.py                ← OHLCV + FRED loader (12h cache)
+│   ├── features.py              ← 14 features
+│   ├── preprocessing.py         ← stationarity · RobustScaler · saves feature_scaler.pkl
+│   └── dataset.py               ← lazy SPYWindowDataset (horizon param)
 │
 ├── models/
-│   ├── diffusion.py           ← MultiTimeframeDiffusion architecture
-│   └── trainer.py             ← AdamW · CosineAnnealingLR · AMP · dual checkpoint
+│   ├── diffusion.py             ← MultiTimeframeDiffusion · save/load checkpoint
+│   └── trainer.py               ← training loop · dual checkpoint · AMP
 │
 ├── backtest/
-│   └── simulation.py          ← regime detection · non-overlapping MC · WFO
+│   └── simulation.py            ← regime detection · non-overlapping MC · WFO
 │
 ├── trading/
-│   ├── inference.py           ← 64×20 DDIM ensemble · returns (signal, vov)
-│   └── live.py                ← regime gate · fixed sizing · bracket orders
+│   ├── inference.py             ← 64×20 DDIM ensemble · returns (signal, vov)
+│   └── live.py                  ← regime gate · fixed sizing · bracket orders
 │
 ├── scripts/
-│   ├── train.py               ← training entry point
-│   ├── evaluate.py            ← backtest entry point
-│   ├── run_live.py            ← live loop (persistent session, regime history)
-│   └── monitor.py             ← terminal health view
+│   ├── train.py                 ← training entry point
+│   ├── evaluate.py              ← backtest entry point
+│   ├── optimize.py              ← walk-forward optimization
+│   ├── run_live.py              ← live loop (persistent TradingSession)
+│   ├── monitor.py               ← terminal status view
+│   └── report.py                ← HTML session report
+│
+├── dashboard/
+│   └── server.py                ← FastAPI dashboard (http://localhost:8080)
 │
 ├── deployment/
-│   ├── deploy.sh              ← Vultr setup (fixed)
-│   ├── spy_quant.service      ← systemd trading loop
+│   ├── deploy.sh                ← Vultr bare-metal setup
+│   ├── spy_quant.service        ← systemd unit (trading loop)
 │   ├── spy_quant_dashboard.service
-│   ├── Dockerfile
+│   ├── Dockerfile               ← python:3.11-slim, CPU torch
 │   └── docker-compose.yml
 │
-├── models/                    ← trading_model.pt · best_model.pt · scaler.pkl
-├── cache/                     ← FRED cache
-└── logs/                      ← daily trading logs
+├── models/                      ← runtime: diffusion_best_trading.pt · diffusion_latest.pt · feature_scaler.pkl
+├── cache/                       ← runtime: FRED data cache
+└── logs/                        ← runtime: daily trading logs
 ```
 
 ---
