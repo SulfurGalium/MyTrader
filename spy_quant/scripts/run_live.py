@@ -34,16 +34,18 @@ logger.add(log_file, rotation="00:00", retention="30 days", level="DEBUG")
 logger.add(sys.stdout, level="INFO")
 
 
-def run_one_cycle(dry_run: bool = False):
-    """One 5-min cycle: generate signal → execute."""
+def run_one_cycle(session: "TradingSession", dry_run: bool = False):
+    """One 5-min cycle: generate signal → update regime history → execute."""
     try:
         from trading.inference import generate_signal
-        from trading.live import TradingSession
 
-        signal_val = generate_signal(symbol="SPY")
-        session    = TradingSession()
-        result     = session.run(signal_val, symbol="SPY")
+        # generate_signal now returns (signal, vov) — vol-of-vol for regime gate
+        signal_val, current_vov = generate_signal(symbol="SPY")
 
+        # Keep regime history up to date before deciding to trade
+        session.update_vov(current_vov)
+
+        result = session.run(signal_val, symbol="SPY", current_vov=current_vov)
         logger.info(f"Cycle complete | {result}")
     except Exception as exc:
         logger.exception(f"Cycle failed: {exc}")
@@ -65,6 +67,12 @@ def main():
     logger.info(f"Starting trading loop — mode: {mode}")
     logger.info(f"Schedule: every 5 minutes  |  Log: {log_file}")
 
+    # Instantiate session once so _vov_history accumulates across all cycles.
+    # Creating a new TradingSession each cycle (the old behaviour) reset the
+    # regime history to empty on every tick, making the regime gate useless.
+    from trading.live import TradingSession
+    session = TradingSession()
+
     # ── Signal handlers for graceful shutdown ─────────────────────────────────
     _running = [True]
 
@@ -73,15 +81,14 @@ def main():
         _running[0] = False
 
     signal.signal(signal.SIGINT, _shutdown)
-    # SIGTERM is not available on Windows — only register if present
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _shutdown)
 
     # ── Schedule every 5 min ──────────────────────────────────────────────────
-    schedule.every(5).minutes.do(run_one_cycle, dry_run=args.dry_run)
+    schedule.every(5).minutes.do(run_one_cycle, session=session, dry_run=args.dry_run)
 
     # Run once immediately on startup
-    run_one_cycle(dry_run=args.dry_run)
+    run_one_cycle(session=session, dry_run=args.dry_run)
 
     while _running[0]:
         schedule.run_pending()
