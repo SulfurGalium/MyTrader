@@ -86,40 +86,69 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ── 5. Install PyTorch (auto-detect GPU vs CPU) ────────────────────────────────
+# Decision is based ONLY on $HasCuda (nvidia-smi result from step 1b).
+# We do NOT read .env here — .env hasn't been created yet at this point in the
+# script. Reading it caused the GPU branch to never trigger (DEVICE defaulted
+# to "cpu" because the file didn't exist), so the CPU wheel was always installed
+# even on machines with a working NVIDIA GPU.
 Write-Host "[3b] Installing PyTorch..." -ForegroundColor Yellow
 
-# Read DEVICE from .env if it already exists, otherwise use GPU detection
-$EnvFilePath = Join-Path $ProjectDir ".env"
-$DeviceSetting = "cpu"
-if (Test-Path $EnvFilePath) {
-    $envContent = Get-Content $EnvFilePath
-    foreach ($line in $envContent) {
-        if ($line -match "^DEVICE\s*=\s*(.+)$") {
-            $DeviceSetting = $Matches[1].Trim()
+# Check if a torch wheel is already installed and whether it matches what we need
+$existingTorch = & $PythonExe -c "import torch; print(torch.__version__)" 2>&1
+$torchInstalled = $LASTEXITCODE -eq 0
+$hasCpuWheel    = $torchInstalled -and ($existingTorch -like "*+cpu*")
+$hasCudaWheel   = $torchInstalled -and ($existingTorch -like "*+cu*")
+
+if ($HasCuda) {
+    if ($hasCudaWheel) {
+        Write-Host "  PyTorch CUDA wheel already installed: $existingTorch" -ForegroundColor Green
+    } else {
+        if ($hasCpuWheel) {
+            Write-Host "  Removing CPU-only PyTorch wheel ($existingTorch)..." -ForegroundColor Yellow
+            & $PythonExe -m pip uninstall torch torchvision torchaudio -y --quiet
+        }
+        Write-Host "  Installing PyTorch with CUDA 12.1 support..." -ForegroundColor Cyan
+        Write-Host "  (This is compatible with your CUDA 13.2 driver)" -ForegroundColor Gray
+        & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  PyTorch (CUDA) installed successfully." -ForegroundColor Green
+        } else {
+            Write-Host "  CUDA 12.1 install failed - trying CUDA 11.8..." -ForegroundColor Yellow
+            & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  Both CUDA wheels failed - falling back to CPU PyTorch." -ForegroundColor Yellow
+                & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+            }
         }
     }
-}
-
-# Auto-detect: if GPU found and DEVICE not explicitly set to cpu, use CUDA
-if ($HasCuda -and $DeviceSetting -ne "cpu") {
-    Write-Host "  Installing PyTorch with CUDA 12.1 support..." -ForegroundColor Cyan
-    & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "  PyTorch (CUDA) installed." -ForegroundColor Green
-    } else {
-        Write-Host "  CUDA install failed - falling back to CPU PyTorch..." -ForegroundColor Yellow
-        & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-    }
 } else {
-    Write-Host "  Installing PyTorch (CPU)..." -ForegroundColor Cyan
-    & $PythonExe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-    Write-Host "  PyTorch (CPU) installed." -ForegroundColor Green
+    if ($torchInstalled -and -not $hasCpuWheel) {
+        Write-Host "  No GPU detected - switching to CPU PyTorch wheel..." -ForegroundColor Yellow
+        & $PythonExe -m pip uninstall torch torchvision torchaudio -y --quiet
+        & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+    } elseif (-not $torchInstalled) {
+        Write-Host "  No GPU detected - installing CPU PyTorch..." -ForegroundColor Cyan
+        & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+    } else {
+        Write-Host "  CPU PyTorch already installed: $existingTorch" -ForegroundColor Green
+    }
 }
 
 # Verify torch sees the GPU
-Write-Host "  Verifying PyTorch device..." -ForegroundColor Yellow
-$torchCheck = & $PythonExe -c "import torch; cuda=torch.cuda.is_available(); print('CUDA available:', cuda); print('Device count:', torch.cuda.device_count()); print('GPU:', torch.cuda.get_device_name(0) if cuda else 'N/A')" 2>&1
-Write-Host "  $torchCheck" -ForegroundColor Cyan
+Write-Host "  Verifying PyTorch device access..." -ForegroundColor Yellow
+$installedVer = & $PythonExe -c "import torch; print(torch.__version__)" 2>&1
+$cudaAvail    = & $PythonExe -c "import torch; print(torch.cuda.is_available())" 2>&1
+Write-Host "  Version   : $installedVer" -ForegroundColor Cyan
+Write-Host "  CUDA avail: $cudaAvail" -ForegroundColor Cyan
+if ($HasCuda -and $cudaAvail -eq "False") {
+    Write-Host ""
+    Write-Host "  WARNING: GPU was detected by nvidia-smi but PyTorch cannot see it." -ForegroundColor Red
+    Write-Host "  The version string above should end in +cu121 not +cpu." -ForegroundColor Red
+    Write-Host "  Try running these manually:" -ForegroundColor Yellow
+    Write-Host "    pip uninstall torch torchvision torchaudio -y" -ForegroundColor Gray
+    Write-Host "    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121" -ForegroundColor Gray
+    Write-Host ""
+}
 
 # ── 6. Set up .env file ────────────────────────────────────────────────────────
 Write-Host "[4/6] Setting up environment file..." -ForegroundColor Yellow
