@@ -2,9 +2,9 @@
 models/trainer.py
 Training loop for MultiTimeframeDiffusion.
 
-LR schedule: linear warmup (10% of epochs) → cosine decay to eta_min=1e-6.
+LR schedule: linear warmup (10% of epochs) -> cosine decay to eta_min=1e-6.
 This replaced the original CosineAnnealingLR-from-epoch-1 approach which
-decayed the LR too aggressively before the model had converged — causing the
+decayed the LR too aggressively before the model had converged -- causing the
 flat loss plateau seen from epoch 20 onward in early runs.
 
 On the fixed-vs-scheduled LR question:
@@ -16,7 +16,7 @@ On the fixed-vs-scheduled LR question:
     The cosine tail lets the model settle into a sharper minimum without
     oscillating. This is the consensus best practice for transformer training
     (Vaswani 2017, Chinchilla 2022).
-  - OneCycleLR: aggressive — works well for CNNs and supervised classification
+  - OneCycleLR: aggressive -- works well for CNNs and supervised classification
     but its fast rise-and-fall can destabilise diffusion model training where
     the loss landscape is much flatter.
 
@@ -44,9 +44,9 @@ import config
 from models.diffusion import MultiTimeframeDiffusion, save_checkpoint
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # LR schedule: linear warmup + cosine decay
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _warmup_cosine_schedule(
     optimizer: torch.optim.Optimizer,
@@ -60,14 +60,14 @@ def _warmup_cosine_schedule(
     Warmup prevents the large random-init gradients from destroying the early
     loss landscape. Cosine decay lets the model settle without oscillating.
 
-    warmup_epochs = max(1, int(total_epochs * 0.10)) gives a 10% warmup —
+    warmup_epochs = max(1, int(total_epochs * 0.10)) gives a 10% warmup --
     e.g. 5 epochs warm-up for a 50-epoch run, 10 for 100 epochs.
     """
     def _lr_lambda(epoch: int) -> float:
         if epoch < warmup_epochs:
-            # Linear ramp 0 → 1
+            # Linear ramp 0 -> 1
             return float(epoch + 1) / float(max(1, warmup_epochs))
-        # Cosine decay from 1 → eta_min_ratio
+        # Cosine decay from 1 -> eta_min_ratio
         progress = float(epoch - warmup_epochs) / float(
             max(1, total_epochs - warmup_epochs)
         )
@@ -77,9 +77,9 @@ def _warmup_cosine_schedule(
     return LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _clone_state(model: nn.Module) -> dict:
     return copy.deepcopy(model.state_dict())
@@ -111,7 +111,7 @@ def _quick_trading_score(
     """
     Fast in-training trading score: sample predictions on a random subset
     of val windows and compute sign-accuracy against actual next returns.
-    Returns value in [0, 1] — higher is better.
+    Returns value in [0, 1] -- higher is better.
 
     Uses try/finally to guarantee model is always restored to train() mode
     even if an exception occurs mid-evaluation. Without this, a failure here
@@ -142,18 +142,18 @@ def _quick_trading_score(
         return float((np.sign(preds) == np.sign(actuals)).mean())
 
     except Exception as exc:
-        logger.warning(f"Trading score eval failed: {exc} — returning 0.0")
+        logger.warning(f"Trading score eval failed: {exc} -- returning 0.0")
         return 0.0
 
     finally:
-        # Always restore — this is the critical fix for the epoch-5 train spike
+        # Always restore -- this is the critical fix for the epoch-5 train spike
         if was_training:
             model.train()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main training function
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def train(
     model:          MultiTimeframeDiffusion,
@@ -175,9 +175,9 @@ def train(
       0.10 (default) = 5 epochs warmup on a 50-epoch run.
       Set to 0.0 to disable warmup entirely (reverts to pure cosine from ep 1).
     """
-    # ── Device setup ──────────────────────────────────────────────────────────
+    # -- Device setup ----------------------------------------------------------
     if device == "cuda" and not torch.cuda.is_available():
-        logger.warning("CUDA not available — falling back to CPU.")
+        logger.warning("CUDA not available -- falling back to CPU.")
         device = "cpu"
 
     dev     = torch.device(device)
@@ -190,20 +190,20 @@ def train(
         torch.backends.cudnn.allow_tf32       = True
         logger.info("CUDA: benchmark=True  TF32=True")
 
-    # ── Compute target_scale from training data ────────────────────────────────
+    # -- Compute target_scale from training data --------------------------------
     # The diffusion process assumes x0 ~ N(0,1). SPY log returns are ~0.001-0.003,
-    # giving SNR ≈ 0.002 at mid-diffusion — the model can't see the signal.
+    # giving SNR ~= 0.002 at mid-diffusion -- the model can't see the signal.
     # We normalise by the std of training targets so x0 is unit-variance.
     # target_scale is stored in the model and checkpoint for inference denorm.
     if val_arr is not None:
         import numpy as np
         # Collect all targets from the train loader (col 0 = log_return)
-        # Use val_arr as proxy since train_arr not passed directly —
+        # Use val_arr as proxy since train_arr not passed directly --
         # compute from the first batch of train_loader instead
         all_targets = []
         for _, _, tgt in train_loader:
             all_targets.append(tgt.numpy())
-            if len(all_targets) >= 50:   # 50 batches × batch_size ≥ 800 samples
+            if len(all_targets) >= 50:   # 50 batches x batch_size >= 800 samples
                 break
         target_std = float(np.concatenate(all_targets).std())
         target_std = max(target_std, 1e-6)   # guard against degenerate data
@@ -213,12 +213,12 @@ def train(
             f"(targets will be divided by this before diffusion)"
         )
     else:
-        logger.warning("val_arr not provided — target_scale not set. Using 1.0.")
+        logger.warning("val_arr not provided -- target_scale not set. Using 1.0.")
 
     model = model.to(dev)
 
     # AdamW: lr=1e-3 is a better starting point for transformer training than
-    # 3e-4 — the warmup prevents it from being too aggressive at init.
+    # 3e-4 -- the warmup prevents it from being too aggressive at init.
     # weight_decay=1e-5 kept low (diffusion models are sensitive to over-regularisation).
     opt = AdamW(model.parameters(), lr=lr, weight_decay=1e-5, betas=(0.9, 0.999))
 
@@ -227,14 +227,14 @@ def train(
     sched = _warmup_cosine_schedule(opt, warmup_epochs, epochs, eta_min_ratio=0.01)
 
     logger.info(
-        f"LR schedule: warmup {warmup_epochs} ep → cosine decay  "
+        f"LR schedule: warmup {warmup_epochs} ep -> cosine decay  "
         f"peak={lr:.1e}  eta_min={lr*0.01:.1e}"
     )
 
     scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
     autocast_ = lambda: torch.amp.autocast(device_type=dev.type, enabled=use_amp)
 
-    # ── Checkpoint selection ──────────────────────────────────────────────────
+    # -- Checkpoint selection --------------------------------------------------
     use_trade_sel = use_trading_selection and val_arr is not None
     if use_trade_sel:
         logger.info(
@@ -251,7 +251,7 @@ def train(
     history          = []
 
     for epoch in range(1, epochs + 1):
-        # ── Train ─────────────────────────────────────────────────────────────
+        # -- Train -------------------------------------------------------------
         model.train()
         t_loss = 0.0
         for fine, coarse, target in train_loader:
@@ -273,7 +273,7 @@ def train(
         t_loss /= max(1, len(train_loader))
         sched.step()
 
-        # ── Validate ──────────────────────────────────────────────────────────
+        # -- Validate ----------------------------------------------------------
         model.eval()
         v_loss = 0.0
         with torch.no_grad():
@@ -285,13 +285,13 @@ def train(
                     v_loss += model(fine, coarse, target).item()
         v_loss /= max(1, len(val_loader))
 
-        # ── Trading score ─────────────────────────────────────────────────────
+        # -- Trading score -----------------------------------------------------
         trade_score = None
         if use_trade_sel and (epoch % eval_interval == 0 or epoch == epochs):
             trade_score = _quick_trading_score(model, val_arr, dev)
             # model.train() is guaranteed by the try/finally inside _quick_trading_score
 
-        # ── Checkpoint selection ──────────────────────────────────────────────
+        # -- Checkpoint selection ----------------------------------------------
         if use_trade_sel and trade_score is not None:
             if trade_score > best_trade_score:
                 best_trade_score = trade_score
@@ -305,17 +305,17 @@ def train(
                     best_ckpt_path,
                 )
                 logger.success(
-                    "  ✓ checkpoint (trade_score=" + str(round(trade_score, 4)) + ")"
-                    + "  → diffusion_best_trading.pt"
+                    "  ? checkpoint (trade_score=" + str(round(trade_score, 4)) + ")"
+                    + "  -> diffusion_best_trading.pt"
                 )
         else:
             if v_loss < best_loss:
                 best_loss  = v_loss
                 best_state = _clone_state(model)
                 save_checkpoint(model, epoch, v_loss)
-                logger.success("  ✓ checkpoint (val=" + str(round(v_loss, 5)) + ")")
+                logger.success("  ? checkpoint (val=" + str(round(v_loss, 5)) + ")")
 
-        # ── Logging ───────────────────────────────────────────────────────────
+        # -- Logging -----------------------------------------------------------
         lr_now = sched.get_last_lr()[0]
         row    = {"epoch": epoch, "train_loss": t_loss,
                   "val_loss": v_loss, "lr": lr_now}
@@ -336,8 +336,8 @@ def train(
             msg += "  sign_acc=" + str(round(trade_score * 100, 1)) + "%"
         logger.info(msg)
 
-        # ── Early stopping ────────────────────────────────────────────────────
-        # Don't trigger early stopping during warmup — loss is still rising
+        # -- Early stopping ----------------------------------------------------
+        # Don't trigger early stopping during warmup -- loss is still rising
         if epoch > warmup_epochs and early_stop(v_loss):
             logger.warning(
                 "Early stopping at epoch " + str(epoch)
