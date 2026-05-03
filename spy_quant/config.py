@@ -44,8 +44,8 @@ DEVICE = _device_env if _device_env else "cuda"
 
 BATCH_SIZE     = int(os.getenv("BATCH_SIZE", 64))
 EPOCHS         = int(os.getenv("EPOCHS", 50))
-LEARNING_RATE  = float(os.getenv("LEARNING_RATE", 1e-3))   # raised from 3e-4
-WARMUP_RATIO   = float(os.getenv("WARMUP_RATIO", 0.10))    # 10% warmup epochs
+LEARNING_RATE  = float(os.getenv("LEARNING_RATE", 3e-4))   # 1e-3 caused instability
+WARMUP_RATIO   = float(os.getenv("WARMUP_RATIO", 0.10))
 
 SEQ_LEN        = 60   # 5-min bars  →  5 hours of history
 COARSE_FACTOR  = 6    # coarse = 30-min bars aggregated from 5-min
