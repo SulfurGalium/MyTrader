@@ -271,6 +271,8 @@ def train(
         t_loss        = 0.0
         counted       = 0
         epoch_skipped = 0
+        epoch_max_norm = 0.0
+        epoch_norm_sum = 0.0
 
         for fine, coarse, target in train_loader:
             fine   = fine.to(dev,   non_blocking=True)
@@ -295,10 +297,16 @@ def train(
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
 
-            # Log large grad norms before clipping so overflow is visible
-            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if grad_norm > 5.0:
-                logger.debug(f"  Large grad norm: {grad_norm:.1f} (clipped to 1.0)")
+            # Clip at 5.0 not 1.0. Clipping at 1.0 was too aggressive --
+            # norms of 5-18 on every batch means the model is genuinely
+            # trying to learn but the clip is cutting 80-95% of every update.
+            # That slows convergence to a crawl without preventing overflow
+            # (float16 overflows at ~65504, not at grad_norm=18).
+            # 5.0 lets real gradient signal through while still blocking
+            # the catastrophic spikes (100+) that cause AMP overflow.
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            epoch_max_norm = max(epoch_max_norm, float(grad_norm))
+            epoch_norm_sum += float(grad_norm)
 
             scaler.step(opt)
             scaler.update()
@@ -310,6 +318,21 @@ def train(
             t_loss = float("nan")
         else:
             t_loss /= counted
+
+        # Log norm summary once per epoch instead of per-batch spam.
+        # max_norm > 50 is genuinely alarming (overflow risk).
+        # max_norm 5-20 is normal for this architecture at early epochs.
+        if counted > 0:
+            avg_norm = epoch_norm_sum / counted
+            if epoch_max_norm > 50.0:
+                logger.warning(
+                    f"Epoch {epoch}: grad norm max={epoch_max_norm:.1f} "
+                    f"avg={avg_norm:.1f} -- overflow risk, consider lowering LR"
+                )
+            else:
+                logger.debug(
+                    f"Epoch {epoch}: grad norm max={epoch_max_norm:.1f} avg={avg_norm:.1f}"
+                )
 
         if epoch_skipped > 0:
             logger.warning(
