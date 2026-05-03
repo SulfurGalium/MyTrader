@@ -44,10 +44,11 @@ DEVICE = _device_env if _device_env else "cuda"
 
 BATCH_SIZE     = int(os.getenv("BATCH_SIZE", 64))
 EPOCHS         = int(os.getenv("EPOCHS", 50))
-# Peak LR after warmup. 1e-4 is safe for this architecture with AMP.
-# 3e-4 caused float16 overflow at epoch 28 (loss spike to 4421 -> weights->0).
-# The warmup still ramps up to this peak smoothly over 10% of epochs.
-LEARNING_RATE  = float(os.getenv("LEARNING_RATE", 1e-4))
+# Peak LR after warmup. 5e-5 keeps grad norms in the 1-5 range for this
+# architecture. 1e-4 was producing norms of 5-18 on every batch, meaning
+# clip_grad_norm was cutting 80-95% of every update -- very slow convergence.
+# The warmup ramps to this peak over 10% of epochs (e.g. 20 epochs of 200).
+LEARNING_RATE  = float(os.getenv("LEARNING_RATE", 5e-5))
 WARMUP_RATIO   = float(os.getenv("WARMUP_RATIO", 0.10))
 
 SEQ_LEN        = 60   # 5-min bars  -  5 hours of history
