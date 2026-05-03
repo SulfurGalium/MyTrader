@@ -231,7 +231,21 @@ def train(
         f"peak={lr:.1e}  eta_min={lr*0.01:.1e}"
     )
 
-    scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
+    # AMP GradScaler -- conservative settings to prevent overflow cascade.
+    # Default init_scale=65536 means a loss spike of 4421 * 65536 = 2.9e8
+    # which overflows float16 (max ~65504), scaler skips the step, halves
+    # scale_factor. If this repeats, scale->1.0, gradients vanish, weights
+    # drift to zero, loss locks at exactly 1.0 (MSE of 0 vs N(0,1)).
+    # init_scale=512 is 128x smaller -- stays safely in float16 range.
+    # growth_interval=200 means scale only grows back after 200 clean batches.
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=use_amp,
+        init_scale=512,
+        growth_factor=2.0,
+        backoff_factor=0.5,
+        growth_interval=200,
+    )
     autocast_ = lambda: torch.amp.autocast(device_type=dev.type, enabled=use_amp)
 
     # -- Checkpoint selection --------------------------------------------------
@@ -249,11 +263,15 @@ def train(
     best_state       = _clone_state(model)
     early_stop       = EarlyStopping(patience=patience, mode="min")
     history          = []
+    skipped_total    = 0
 
     for epoch in range(1, epochs + 1):
         # -- Train -------------------------------------------------------------
         model.train()
-        t_loss = 0.0
+        t_loss        = 0.0
+        counted       = 0
+        epoch_skipped = 0
+
         for fine, coarse, target in train_loader:
             fine   = fine.to(dev,   non_blocking=True)
             coarse = coarse.to(dev, non_blocking=True)
@@ -263,15 +281,64 @@ def train(
             with autocast_():
                 loss = model(fine, coarse, target)
 
+            # Batch-level loss guard: skip this batch if loss is pathological.
+            # A single data outlier at high LR can create a gradient that
+            # overflows float16 even after forward-pass clamping, because
+            # gradients flow back through the clamp operation.
+            loss_val = loss.item()
+            if not (loss_val == loss_val) or loss_val > 10.0:
+                epoch_skipped += 1
+                skipped_total += 1
+                opt.zero_grad(set_to_none=True)
+                continue
+
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            # Log large grad norms before clipping so overflow is visible
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if grad_norm > 5.0:
+                logger.debug(f"  Large grad norm: {grad_norm:.1f} (clipped to 1.0)")
+
             scaler.step(opt)
             scaler.update()
-            t_loss += loss.item()
+            t_loss  += loss_val
+            counted += 1
 
-        t_loss /= max(1, len(train_loader))
+        if counted == 0:
+            logger.error(f"Epoch {epoch}: ALL batches skipped -- model collapsed.")
+            t_loss = float("nan")
+        else:
+            t_loss /= counted
+
+        if epoch_skipped > 0:
+            logger.warning(
+                f"Epoch {epoch}: {epoch_skipped} bad batches skipped "
+                f"(loss>10 or nan). Running total: {skipped_total}"
+            )
+
         sched.step()
+
+        # Dead-model detector: loss locked at ~1.0 means weights -> 0.
+        # Restore last good checkpoint and halve LR to escape the basin.
+        if len(history) >= 3:
+            recent_train = [h["train_loss"] for h in history[-3:]]
+            if all(abs(l - 1.0) < 0.02 for l in recent_train if l == l):
+                logger.error(
+                    "DEAD MODEL: train loss locked at ~1.0 for 3 epochs. "
+                    "Restoring best checkpoint and halving LR."
+                )
+                model.load_state_dict(best_state)
+                for pg in opt.param_groups:
+                    pg["lr"] *= 0.5
+                logger.info(
+                    "  Restored checkpoint. New LR: "
+                    + f"{opt.param_groups[0]['lr']:.2e}"
+                )
+                scaler = torch.amp.GradScaler(
+                    "cuda", enabled=use_amp,
+                    init_scale=256, growth_interval=500,
+                )
 
         # -- Validate ----------------------------------------------------------
         model.eval()
