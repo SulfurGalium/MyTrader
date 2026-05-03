@@ -80,7 +80,11 @@ class TransformerEncoder(nn.Module):
             d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
             dropout=dropout, batch_first=True, norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        # enable_nested_tensor=False: norm_first=True disables nested tensor
+        # optimisation anyway; setting it explicitly suppresses the UserWarning
+        self.encoder = nn.TransformerEncoder(
+            layer, num_layers=n_layers, enable_nested_tensor=False
+        )
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:   # (B, L, F) → (B, L, D)

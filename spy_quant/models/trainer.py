@@ -112,29 +112,43 @@ def _quick_trading_score(
     Fast in-training trading score: sample predictions on a random subset
     of val windows and compute sign-accuracy against actual next returns.
     Returns value in [0, 1] — higher is better.
-    Used as checkpoint selection metric every eval_interval epochs.
+
+    Uses try/finally to guarantee model is always restored to train() mode
+    even if an exception occurs mid-evaluation. Without this, a failure here
+    leaves the model stuck in eval mode for the rest of the training epoch,
+    causing a large loss spike (seen as train=0.764 at epoch 5 vs 0.703 at ep4).
     """
     import numpy as np
     from data.dataset import SPYWindowDataset
 
-    ds  = SPYWindowDataset(val_arr)
-    idx = np.random.choice(len(ds), size=min(n_samples, len(ds)), replace=False)
+    was_training = model.training
+    try:
+        model.eval()
+        ds  = SPYWindowDataset(val_arr)
+        idx = np.random.choice(len(ds), size=min(n_samples, len(ds)), replace=False)
 
-    preds, actuals = [], []
-    model.eval()
-    with torch.no_grad():
-        for i in idx:
-            fine, coarse, target = ds[i]
-            fine   = fine.unsqueeze(0).to(device)
-            coarse = coarse.unsqueeze(0).to(device)
-            pred   = model.sample(fine, coarse, steps=10).item()
-            preds.append(pred)
-            actuals.append(target.item())
+        preds, actuals = [], []
+        with torch.no_grad():
+            for i in idx:
+                fine, coarse, target = ds[i]
+                fine   = fine.unsqueeze(0).to(device)
+                coarse = coarse.unsqueeze(0).to(device)
+                pred   = model.sample(fine, coarse, steps=10).item()
+                preds.append(pred)
+                actuals.append(target.item())
 
-    preds   = np.array(preds)
-    actuals = np.array(actuals)
-    sign_acc = float((np.sign(preds) == np.sign(actuals)).mean())
-    return sign_acc
+        preds   = np.array(preds)
+        actuals = np.array(actuals)
+        return float((np.sign(preds) == np.sign(actuals)).mean())
+
+    except Exception as exc:
+        logger.warning(f"Trading score eval failed: {exc} — returning 0.0")
+        return 0.0
+
+    finally:
+        # Always restore — this is the critical fix for the epoch-5 train spike
+        if was_training:
+            model.train()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,7 +265,7 @@ def train(
         trade_score = None
         if use_trade_sel and (epoch % eval_interval == 0 or epoch == epochs):
             trade_score = _quick_trading_score(model, val_arr, dev)
-            model.train()
+            # model.train() is guaranteed by the try/finally inside _quick_trading_score
 
         # ── Checkpoint selection ──────────────────────────────────────────────
         if use_trade_sel and trade_score is not None:
