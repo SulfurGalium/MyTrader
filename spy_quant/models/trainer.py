@@ -184,12 +184,36 @@ def train(
     use_amp = dev.type == "cuda"
     logger.info("Training on: " + str(dev) + "  AMP=" + str(use_amp))
 
-    # ── CUDA optimisations ────────────────────────────────────────────────────
     if dev.type == "cuda":
         torch.backends.cudnn.benchmark        = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32       = True
         logger.info("CUDA: benchmark=True  TF32=True")
+
+    # ── Compute target_scale from training data ────────────────────────────────
+    # The diffusion process assumes x0 ~ N(0,1). SPY log returns are ~0.001-0.003,
+    # giving SNR ≈ 0.002 at mid-diffusion — the model can't see the signal.
+    # We normalise by the std of training targets so x0 is unit-variance.
+    # target_scale is stored in the model and checkpoint for inference denorm.
+    if val_arr is not None:
+        import numpy as np
+        # Collect all targets from the train loader (col 0 = log_return)
+        # Use val_arr as proxy since train_arr not passed directly —
+        # compute from the first batch of train_loader instead
+        all_targets = []
+        for _, _, tgt in train_loader:
+            all_targets.append(tgt.numpy())
+            if len(all_targets) >= 50:   # 50 batches × batch_size ≥ 800 samples
+                break
+        target_std = float(np.concatenate(all_targets).std())
+        target_std = max(target_std, 1e-6)   # guard against degenerate data
+        model.target_scale = target_std
+        logger.info(
+            f"Target scale set: {target_std:.6f}  "
+            f"(targets will be divided by this before diffusion)"
+        )
+    else:
+        logger.warning("val_arr not provided — target_scale not set. Using 1.0.")
 
     model = model.to(dev)
 
