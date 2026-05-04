@@ -205,21 +205,45 @@ def train(
             all_targets.append(tgt.numpy())
             if len(all_targets) >= 50:   # 50 batches x batch_size >= 800 samples
                 break
-        target_std = float(np.concatenate(all_targets).std())
-        target_std = max(target_std, 1e-6)   # guard against degenerate data
+        target_arr = np.concatenate(all_targets)
+        target_std = float(target_arr.std())
+        if not (target_std == target_std) or target_std < 1e-8:
+            logger.warning(
+                f"target_std={target_std:.2e} is zero/nan -- using 1.0. "
+                "Check dataset returns non-constant targets."
+            )
+            target_std = 1.0
         model.target_scale = target_std
         logger.info(
-            f"Target scale set: {target_std:.6f}  "
-            f"(targets will be divided by this before diffusion)"
+            f"Target scale: {target_std:.6f}  "
+            f"(min={float(target_arr.min()):.6f}  max={float(target_arr.max()):.6f})"
         )
     else:
         logger.warning("val_arr not provided -- target_scale not set. Using 1.0.")
 
     model = model.to(dev)
 
-    # AdamW: lr=1e-3 is a better starting point for transformer training than
-    # 3e-4 -- the warmup prevents it from being too aggressive at init.
-    # weight_decay=1e-5 kept low (diffusion models are sensitive to over-regularisation).
+    # Sanity check: detect nan/inf in first batch BEFORE training starts.
+    # StandardScaler produces inf if any feature column has std=0 (constant).
+    # This is the direct cause of "grad norm = inf" on epoch 1 -- the
+    # forward pass produces inf activations, backward produces inf gradients,
+    # clip_grad_norm_ reports inf, and the scaler skips every update.
+    _sf, _, _ = next(iter(train_loader))
+    if torch.isnan(_sf).any() or torch.isinf(_sf).any():
+        bad = (torch.isnan(_sf) | torch.isinf(_sf)).any(dim=(0, 1))
+        bad_cols = [i for i, b in enumerate(bad) if b]
+        logger.error(
+            f"NaN/Inf in training features at columns {bad_cols}. "
+            "This causes inf grad norms from batch 1. "
+            "Delete feature_scaler.pkl and retrain to regenerate with StandardScaler."
+        )
+    else:
+        feat_std = _sf.std(dim=(0, 1))
+        logger.info(
+            f"Feature check OK: scaled std {feat_std.min():.3f} - {feat_std.max():.3f}"
+        )
+    del _sf
+
     opt = AdamW(model.parameters(), lr=lr, weight_decay=1e-5, betas=(0.9, 0.999))
 
     # Warmup + cosine schedule
@@ -231,21 +255,18 @@ def train(
         f"peak={lr:.1e}  eta_min={lr*0.01:.1e}"
     )
 
-    # AMP GradScaler -- conservative settings to prevent overflow cascade.
-    # Default init_scale=65536 means a loss spike of 4421 * 65536 = 2.9e8
-    # which overflows float16 (max ~65504), scaler skips the step, halves
-    # scale_factor. If this repeats, scale->1.0, gradients vanish, weights
-    # drift to zero, loss locks at exactly 1.0 (MSE of 0 vs N(0,1)).
-    # init_scale=512 is 128x smaller -- stays safely in float16 range.
-    # growth_interval=200 means scale only grows back after 200 clean batches.
+    # GradScaler: no device arg (reference pattern from train.py).
+    # Hardcoding "cuda" causes inf gradients when falling back to CPU.
+    # init_scale=256: 65536 (default) * activations can overflow float16.
+    # growth_interval=500: scale grows back slowly after overflow events.
     scaler = torch.amp.GradScaler(
-        "cuda",
         enabled=use_amp,
-        init_scale=512,
+        init_scale=256,
         growth_factor=2.0,
         backoff_factor=0.5,
-        growth_interval=200,
+        growth_interval=500,
     )
+    # Use dev.type dynamically (reference pattern) -- handles CPU fallback correctly
     autocast_ = lambda: torch.amp.autocast(device_type=dev.type, enabled=use_amp)
 
     # -- Checkpoint selection --------------------------------------------------
